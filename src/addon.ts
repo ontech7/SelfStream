@@ -1,7 +1,7 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 import { getVixSrcStreams } from './vixsrc';
 import { getVixCloudStreams } from './vixcloud';
-import { getCinemaCityStreams } from './cinemacity';
+import { getCinemaCityStreams, extractFreshStreamUrl, CINEMACITY_HEADERS } from './cinemacity';
 import { decodeProxyToken, resolveUrl, makeProxyToken, getAddonBase } from './proxy';
 import { decodeConfig, UserConfig, DEFAULT_CONFIG } from './config';
 import { request } from 'undici';
@@ -168,6 +168,107 @@ app.get('/stream/:type/:id.json', async (req: any, res: any) => {
         res.json({ streams: fixed });
     } catch (err: any) {
         res.status(500).json({ error: err?.message || 'Internal Error' });
+    }
+});
+
+// ── CinemaCity Lazy Proxy: resolves fresh CDN URL at playback time ──
+app.get('/proxy/cc/manifest.m3u8', async (req: any, res: any) => {
+    try {
+        const token = req.query.token;
+        if (!token) return res.status(400).send('#EXTM3U\n# Missing token');
+
+        let decoded: any;
+        try {
+            decoded = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+        } catch {
+            return res.status(400).send('#EXTM3U\n# Invalid token');
+        }
+
+        const pageUrl = decoded?.page;
+        if (!pageUrl) return res.status(400).send('#EXTM3U\n# Missing page URL');
+
+        // Scrape the page NOW to get a fresh CDN URL
+        const freshUrl = await extractFreshStreamUrl(pageUrl);
+        if (!freshUrl) {
+            return res.status(502).send('#EXTM3U\n# Failed to resolve stream from CinemaCity');
+        }
+
+        const addonBase = getAddonBase(req);
+
+        // If it's an HLS stream, fetch and rewrite it through the standard proxy
+        if (freshUrl.includes('.m3u8')) {
+            console.log(`[CC Proxy] Fetching HLS: ${freshUrl.substring(0, 80)}...`);
+            const { body, statusCode } = await request(freshUrl, { headers: CINEMACITY_HEADERS });
+            if (statusCode !== 200) {
+                return res.status(502).send(`#EXTM3U\n# CDN error ${statusCode}`);
+            }
+
+            const text = await body.text();
+
+            // If master playlist, rewrite variant URLs through HLS proxy
+            if (text.includes('#EXT-X-STREAM-INF:')) {
+                const lines = text.split(/\r?\n/);
+                const result: string[] = ['#EXTM3U'];
+
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (line.startsWith('#EXT-X-MEDIA:') && line.includes('URI=')) {
+                        const rewritten = line.replace(/URI="([^"]+)"/, (_m: string, uri: string) => {
+                            const absUri = resolveUrl(freshUrl, uri);
+                            const segToken = makeProxyToken(absUri, CINEMACITY_HEADERS, 30 * 60 * 1000);
+                            return `URI="${addonBase}/proxy/hls/manifest.m3u8?token=${segToken}"`;
+                        });
+                        result.push(rewritten);
+                    } else if (line.startsWith('#EXT-X-STREAM-INF:')) {
+                        result.push(line);
+                        const nextLine = lines[i + 1];
+                        if (nextLine && !nextLine.startsWith('#')) {
+                            const absUrl = resolveUrl(freshUrl, nextLine.trim());
+                            const variantToken = makeProxyToken(absUrl, CINEMACITY_HEADERS, 30 * 60 * 1000);
+                            result.push(`${addonBase}/proxy/hls/manifest.m3u8?token=${variantToken}`);
+                            i++;
+                        }
+                    } else if (line === '#EXTM3U') {
+                        continue;
+                    } else {
+                        result.push(line);
+                    }
+                }
+
+                res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                res.setHeader('Cache-Control', 'no-store');
+                return res.send(result.join('\n'));
+            }
+
+            // Media playlist: rewrite segments
+            const lines = text.split(/\r?\n/);
+            const result: string[] = [];
+            for (const line of lines) {
+                if (line.includes('#EXT-X-KEY:') && line.includes('URI=')) {
+                    const rewritten = line.replace(/URI="([^"]+)"/, (_m: string, uri: string) => {
+                        const absUri = resolveUrl(freshUrl, uri);
+                        const segToken = makeProxyToken(absUri, CINEMACITY_HEADERS, 30 * 60 * 1000);
+                        return `URI="${addonBase}/proxy/hls/segment.ts?token=${segToken}"`;
+                    });
+                    result.push(rewritten);
+                } else if (!line.startsWith('#') && line.trim()) {
+                    const absUrl = resolveUrl(freshUrl, line.trim());
+                    const segToken = makeProxyToken(absUrl, CINEMACITY_HEADERS, 30 * 60 * 1000);
+                    result.push(`${addonBase}/proxy/hls/segment.ts?token=${segToken}`);
+                } else {
+                    result.push(line);
+                }
+            }
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            res.setHeader('Cache-Control', 'no-store');
+            return res.send(result.join('\n'));
+        }
+
+        // MP4 — redirect directly
+        return res.redirect(302, freshUrl);
+    } catch (e: any) {
+        console.error('[CC Proxy] error:', e?.message || e);
+        res.status(500).send('#EXTM3U\n# Internal error');
     }
 });
 
